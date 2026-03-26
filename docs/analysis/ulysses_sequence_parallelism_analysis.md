@@ -25,9 +25,14 @@ veomni/distributed/sequence_parallel/
 └── utils.py                # 辅助工具函数
 
 tests/parallel/ulysses/
-├── test_ulysses.py         # 同步模式测试
-├── test_async_ulysses.py   # 异步模式测试
-└── attention.py            # 参考 Attention 实现
+├── __init__.py                  # 包初始化
+├── test_ulysses.py              # 同步模式测试
+├── test_async_ulysses.py        # 异步模式测试
+├── test_slice_input_tensor.py   # 输入切片测试
+├── test_all_gather.py           # All-gather 测试
+├── attention.py                 # 参考 Attention 实现
+├── normalization.py             # LayerNorm 辅助实现
+└── utils.py                     # 测试工具函数
 ```
 
 ## 2. 核心算法原理
@@ -230,17 +235,14 @@ def gather_heads_scatter_seq(x: Tensor, head_dim: int, seq_dim: int,
 ```python
 class Attention(nn.Module):
     def forward(self, x: torch.Tensor, unpadded_seq_len: int):
-        # QKV 投影
+        # QKV 投影，输出 shape: [batch, seq_len/P, hidden_dim]
         q = self.q_proj(x)
         k = self.k_proj(x)
         v = self.v_proj(x)
 
-        # Reshape to [batch, seq, num_heads, head_dim]
-        q = q.view(B, seq_len, self.num_heads, self.head_dim)
-        k = k.view(B, seq_len, self.num_heads, self.head_dim)
-        v = v.view(B, seq_len, self.num_heads, self.head_dim)
-
-        # Attention 前：聚合序列，分散头
+        # Attention 前：聚合序列，分散头（注意：此时 q/k/v 仍是 3D 张量）
+        # 输入 shape: [batch, seq_len/P, hidden_dim]
+        # 输出 shape: [batch, seq_len, hidden_dim/P]
         q = gather_seq_scatter_heads(q, seq_dim=1, head_dim=2,
                                       unpadded_dim_size=unpadded_seq_len)
         k = gather_seq_scatter_heads(k, seq_dim=1, head_dim=2,
@@ -248,23 +250,59 @@ class Attention(nn.Module):
         v = gather_seq_scatter_heads(v, seq_dim=1, head_dim=2,
                                       unpadded_dim_size=unpadded_seq_len)
 
+        # all-to-all 之后才 reshape 为 4D: [batch, seq_len, num_heads/P, head_dim]
+        q = rearrange(q, "B N (h d) -> B N h d", d=self.head_dim).contiguous()
+        k = rearrange(k, "B N (h d) -> B N h d", d=self.head_dim).contiguous()
+        v = rearrange(v, "B N (h d) -> B N h d", d=self.head_dim).contiguous()
+
         # QK Normalization (可选)
-        if self.qk_norm:
-            q = self.q_norm(q)
-            k = self.k_norm(k)
+        q, k = self.q_norm(q), self.k_norm(k)
 
         # Attention 计算（FlashAttention、SDPA 等）
         x = F.scaled_dot_product_attention(q, k, v, ...)
 
-        # Attention 后：聚合头，分散序列
+        # Attention 后：先 reshape 回 3D，再聚合头、分散序列
+        x = rearrange(x, "B N h d -> B N (h d)", d=self.head_dim)
         x = gather_heads_scatter_seq(x, head_dim=2, seq_dim=1)
 
         # Output 投影
-        x = x.view(B, seq_len, -1)
         x = self.proj_o(x)
 
         return x
 ```
+
+**关键顺序**：同步模式下，`gather_seq_scatter_heads` 在 3D 张量（`[B, N, hidden_dim]`）上操作，**先** all-to-all 通信、**后** reshape 为 4D。这与异步模式不同——异步模式在投影后立即 reshape 为 4D 再做 all-to-all。
+
+### 3.5 融合 QKV 通信优化
+
+**gather_seq_scatter_heads_qkv** (第 253-292 行)
+
+该函数将融合的 QKV 张量在一次 all-to-all 通信中完成序列-头维度的交换，相比对 Q、K、V 分别调用 `gather_seq_scatter_heads`（三次通信），可以减少通信次数：
+
+```python
+def gather_seq_scatter_heads_qkv(
+    qkv_tensor: Tensor,
+    seq_dim: int,
+    unpadded_dim_size: Optional[int] = None,
+    restore_shape: bool = True,
+    group: ProcessGroup = None,
+) -> Tensor:
+    """
+    对融合的 QKV 张量进行 all-to-all 通信
+
+    Args:
+        qkv_tensor: 融合 QKV 张量，最后一个维度包含 3 个投影（Q、K、V 拼接）
+        seq_dim: 序列维度索引
+        unpadded_dim_size: 未 padding 的序列长度（用于 unpad）
+        restore_shape: 是否将输出恢复为与输入相同的维度数
+    """
+    # 1. 将最后一维拆分为 [3, proj_dim//3]，新增 scatter_dim
+    # 2. 执行一次 all-to-all：scatter 在新增的维度上，gather 在 seq_dim 上
+    # 3. 如果 restore_shape，reshape 回原始维度数
+    # 4. 移除 padding（如果需要）
+```
+
+**适用场景**：当模型使用融合 QKV 投影（`nn.Linear(dim, 3 * dim)`）时，可以用此函数替代三次独立的 `gather_seq_scatter_heads` 调用。
 
 ## 4. 异步模式（Async）实现详解
 
@@ -291,6 +329,22 @@ class Attention(nn.Module):
 ### 4.2 核心实现
 
 #### 文件：`veomni/distributed/sequence_parallel/async_ulysses.py`
+
+**QKV 权重分割工具** (第 37-45 行)
+
+异步模式需要将融合 QKV 权重拆分为独立的 Q、K、V 权重：
+
+```python
+def divide_qkv_linear_weight(weight: Tensor, dim: int):
+    """将融合 QKV 权重沿指定维度拆分为 3 份"""
+    return weight.chunk(3, dim=dim)
+
+def divide_qkv_linear_bias(bias: Tensor, dim: int):
+    """将融合 QKV 偏置沿指定维度拆分为 3 份"""
+    if bias is not None:
+        return bias.chunk(3, dim=dim)
+    return None, None, None
+```
 
 **AsyncUlyssesQKVProjection** (第 48-209 行)
 
@@ -697,6 +751,22 @@ with UlyssesGroupKeyManager("vision"):
     x = gather_seq_scatter_heads(x, seq_dim=1, head_dim=2)
 ```
 
+### 5.4 初始化状态检查
+
+`comm.py` 提供了两个辅助函数用于检查并行组是否已初始化（第 328-339 行）：
+
+```python
+def is_ulysses_sequence_parallel_initialized() -> bool:
+    """检查 Ulysses 序列并行是否已初始化"""
+    return get_ulysses_sequence_parallel_group() is not None
+
+def is_context_parallel_initialized() -> bool:
+    """检查 Context Parallel 是否已初始化"""
+    return get_context_parallel_group() is not None
+```
+
+这些函数可用于条件执行序列并行相关的逻辑。
+
 ## 6. 数据预处理与后处理
 
 ### 6.1 输入数据预处理
@@ -796,6 +866,62 @@ def gather_outputs(
 
 对于 Vision-Language 模型，图像 tokens 数量可能在不同样本间变化，需要特殊的 all-to-all 处理：
 
+**sp_pad_and_slice** (第 16-61 行)
+
+专为 VLM token merging 场景设计的函数，支持 `pad_scale` 参数来确保 padding 后的长度满足 `sp_size * pad_scale` 的整除要求：
+
+```python
+def sp_pad_and_slice(
+    tensor: torch.Tensor,
+    dim: int = -1,
+    pad_value: int = 0,
+    pad_scale: int = 1,
+) -> torch.Tensor:
+    """
+    对张量进行 padding 和切片以适配 SP 分布
+
+    1. Padding: 确保张量长度能被 (sp_size * pad_scale) 整除
+    2. Slice: 按 sp_rank 提取当前 rank 的数据块
+
+    Args:
+        pad_scale: SP size 的缩放因子，用于 VLM token merging 场景
+                   确保 padding 在 merge 操作前就处理正确
+    """
+```
+
+**适用场景**：某些 VLM 在 ViT encoder 后会做 token merging（如 2x2 合并），此时需要 `pad_scale=4` 确保 padding 后的长度同时满足 SP 分片和 token merging 的整除要求。
+
+**slice_position_embedding** (第 125-141 行)
+
+用于 RoPE 位置编码的切片，确保每个 SP rank 获取正确的 cos/sin 值：
+
+```python
+def slice_position_embedding(
+    position_embeddings: tuple,
+    dim: int = 1,
+    sp_group: dist.ProcessGroup = None,
+) -> tuple:
+    """将 (cos, sin) 位置编码沿序列维度切片到当前 rank"""
+    if sp_group is not None:
+        cos, sin = position_embeddings
+        cos = slice_input_tensor(cos, dim=dim, padding=False, group=sp_group)
+        sin = slice_input_tensor(sin, dim=dim, padding=False, group=sp_group)
+        return (cos, sin)
+    return position_embeddings
+```
+
+**slice_input_tensor_scale_grad** (第 89-102 行)
+
+带梯度缩放的输入切片，反向传播时通过 all-gather 恢复完整梯度并可选地除以 SP world size：
+
+```python
+def slice_input_tensor_scale_grad(
+    x: Tensor, dim: int,
+    group: ProcessGroup = None, scale_grad=True,
+) -> Tensor:
+    """切片输入张量，反向传播时自动 all-gather 并可选缩放梯度"""
+```
+
 **all_to_all_images** (第 316-321 行)
 
 ```python
@@ -821,55 +947,105 @@ def all_to_all_images(image_embeds, in_splits, out_splits):
 
 #### 文件：`veomni/distributed/sequence_parallel/loss.py`
 
-在序列并行中，每个 rank 只计算部分序列的损失，需要进行全局聚合：
+在序列并行中，每个 rank 只计算部分序列的损失，需要进行全局聚合。
+
+**ReduceLoss** (第 27-47 行)
+
+`ReduceLoss` 是一个 `torch.autograd.Function`，正确处理前向和反向传播中的损失缩放：
 
 ```python
-def reduce_sequence_parallel_loss(
-    loss: torch.Tensor,
-    num_valid_tokens: int,
-    sp_group: Optional[ProcessGroup] = None,
-) -> torch.Tensor:
-    """
-    聚合序列并行组内的损失
+class ReduceLoss(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, loss: torch.Tensor, num_valid_tokens: torch.Tensor) -> torch.Tensor:
+        # 边界条件：如果当前 rank 没有有效 token，清除 NaN
+        if num_valid_tokens == 0:
+            loss = torch.nan_to_num(loss)
 
-    Args:
-        loss: 当前 rank 的损失（已经是 sum，非 mean）
-        num_valid_tokens: 当前 rank 的有效 token 数（排除 IGNORE_INDEX）
-        sp_group: 序列并行进程组
+        local_num_tokens = num_valid_tokens.detach().clone()
 
-    Returns:
-        全局平均损失
-    """
-    if sp_group is None:
+        # 将 mean loss 转为 sum: loss *= local_num_tokens
+        loss *= num_valid_tokens
+
+        # 跨 SP 组 all-reduce 求全局 sum
+        group = get_unified_sequence_parallel_group()
+        dist.all_reduce(loss, group=group)          # loss 变为全局 sum
+        dist.all_reduce(num_valid_tokens, group=group)  # 变为全局 token 数
+
+        ctx.save_for_backward(local_num_tokens, num_valid_tokens)
+
+        # 全局平均
         return loss / num_valid_tokens
 
-    # 聚合所有 rank 的损失和有效 token 数
-    global_loss = dist.all_reduce(loss, group=sp_group, async_op=False)
-    global_num_valid_tokens = dist.all_reduce(
-        torch.tensor(num_valid_tokens, device=loss.device),
-        group=sp_group,
-        async_op=False
-    )
-
-    # 全局平均
-    return global_loss / global_num_valid_tokens
+    @staticmethod
+    def backward(ctx, grad_output: torch.Tensor):
+        local_num_tokens, global_num_tokens = ctx.saved_tensors
+        # 关键：反向传播需要正确的梯度缩放
+        # 乘以 sp_size * local_tokens / global_tokens
+        grad_output = (
+            get_unified_sequence_parallel_world_size()
+            * local_num_tokens * grad_output / global_num_tokens
+        )
+        return grad_output, None
 ```
+
+**设计要点**：
+1. **边界条件处理**：当 `num_valid_tokens == 0` 时（例如某个 rank 的所有 token 都是 padding），使用 `torch.nan_to_num` 清除 NaN，避免梯度爆炸
+2. **前向传播**：先将 mean loss 转换为 sum（`loss *= num_valid_tokens`），然后 all-reduce 求全局 sum，最后除以全局 token 数得到全局 mean
+3. **反向传播梯度缩放**：梯度需要乘以 `sp_size * local_tokens / global_tokens`，这是因为 FSDP 默认会除以其 world size，需要补偿 SP 维度的影响
+4. **进程组**：内部通过 `get_unified_sequence_parallel_group()` 获取，**不需要外部传入 `sp_group` 参数**
+
+**reduce_sequence_parallel_loss** (第 50-51 行)
+
+```python
+def reduce_sequence_parallel_loss(loss: torch.Tensor, num_valid_tokens: torch.Tensor) -> torch.Tensor:
+    return ReduceLoss.apply(loss, num_valid_tokens)
+```
+
+**注意**：
+- `num_valid_tokens` 是 `torch.Tensor` 类型（不是 `int`）
+- 只接收 2 个参数，不传 `sp_group`
 
 **使用示例**：
 
 ```python
-# 计算当前 rank 的损失
+from veomni.distributed.sequence_parallel import reduce_sequence_parallel_loss
+
+# 计算当前 rank 的损失（mean reduction）
 logits = model(input_ids, ...)
 loss = F.cross_entropy(logits.view(-1, vocab_size), labels.view(-1),
-                       ignore_index=IGNORE_INDEX, reduction='sum')
+                       ignore_index=IGNORE_INDEX, reduction='mean')
 num_valid_tokens = (labels != IGNORE_INDEX).sum()
 
-# 序列并行损失聚合
-if sp_enabled:
-    loss = reduce_sequence_parallel_loss(loss, num_valid_tokens, sp_group)
-else:
-    loss = loss / num_valid_tokens
+# 序列并行损失聚合（只需 2 个参数）
+loss = reduce_sequence_parallel_loss(loss, num_valid_tokens)
 ```
+
+### 7.2 训练中的实际 Loss 处理
+
+#### 文件：`veomni/utils/loss_utils.py`
+
+在实际训练中，loss 聚合是通过 `mean_global_loss()` 函数完成的，它是更高层级的 loss 处理入口：
+
+```python
+def mean_global_loss(
+    losses: Union[dict[str, torch.Tensor], torch.Tensor],
+    micro_batch_token_len: dict[str, torch.Tensor],
+    micro_batches_token_len: dict[str, torch.Tensor],
+):
+    """
+    计算全局平均损失
+
+    处理逻辑：
+    1. 如果启用了 SP，先在 SP 组内 all-reduce 当前 micro-batch 的 token 数
+    2. 在全局范围内 all-reduce 所有 micro-batches 的总 token 数
+    3. 按比例缩放 loss: cur_loss * cur_token_len / all_reduced_len * fsdp_size
+    4. 如果启用了 SP，额外除以 sp_size 补偿 FSDP 梯度同步
+    """
+```
+
+`mean_global_loss` 与 `reduce_sequence_parallel_loss` 的区别在于：
+- `reduce_sequence_parallel_loss`：底层 autograd Function，处理单个 loss 的 SP 聚合
+- `mean_global_loss`：高层工具函数，处理多种 loss（text loss、image decoder loss 等）的全局聚合，内部自行处理 SP token 数的 all-reduce
 
 ## 8. 与 FSDP/FSDP2 集成
 
@@ -879,18 +1055,24 @@ VeOmni 使用 PyTorch 的 DeviceMesh 统一管理各种并行维度。
 
 #### 文件：`veomni/distributed/parallel_state.py`
 
-**设备网格维度**：
+**设备网格维度**（第 487-493 行）：
+
+完整的维度定义为：
 ```
-[dp_replicate, dp_shard, ulysses, cp, tp]
+[pp, dp_replicate, dp_shard, ulysses, cp, tp]
 ```
 
+但维度是**条件性包含**的：只有当 `d > 1` 或维度名称为 `dp_shard` 时才会被加入 mesh。例如，如果 `pp_size=1` 且 `tp_size=1`，则实际 mesh 可能只有 `[dp_shard, ulysses]`。
+
+- **pp**：Pipeline Parallel 维度
 - **dp_replicate**：数据并行复制维度（ZeRO-0）
-- **dp_shard**：数据并行分片维度（FSDP）
+- **dp_shard**：数据并行分片维度（FSDP，始终包含）
 - **ulysses**：Ulysses 序列并行维度
 - **cp**：Context Parallel 维度（Ring Attention，尚未完全支持）
 - **tp**：Tensor Parallel 维度
 
-**组合进程组**：
+**组合进程组**（第 501-536 行）：
+- **dp**：`[dp_replicate, dp_shard]` - 用于数据加载（不进行通信）
 - **dp_shard_sp**：`[dp_shard, ulysses, cp]` - 用于 FSDP 参数分片
 - **sp**：`[ulysses, cp]` - 用于序列并行操作
 - **dp_sp**：`[dp_replicate, dp_shard, ulysses, cp]` - 用于损失 all-reduce
@@ -945,6 +1127,29 @@ parallel_state = ParallelState(
 - 使用动态 batching 尽量凑齐整除的序列长度
 - Padding 时使用特殊值（0 for input_ids, IGNORE_INDEX for labels）
 - 在 all-to-all 后及时 unpad，避免无效计算
+
+**Unpadding 策略**（`veomni/distributed/sequence_parallel/utils.py`）：
+
+框架提供两种 unpadding 策略：
+
+1. **`unpadding_tensor_for_seqeunce_parallel`**（第 29-41 行）：在聚合后的完整张量上移除 padding（所有 rank 上都移除末尾 padding）
+2. **`remove_last_rank_padding`**（第 72-84 行）：只在最后一个 rank 上移除 padding，其他 rank 的数据保持不变
+
+```python
+def remove_last_rank_padding(
+    x: Tensor, dim: int, unpad_dim_size: int, group: ProcessGroup = None
+) -> Tensor:
+    """只在最后一个 SP rank 上移除 padding"""
+    sp_rank = get_ulysses_sequence_parallel_rank(group)
+    sp_world = get_ulysses_sequence_parallel_world_size(group)
+    if unpad_dim_size % sp_world == 0 and sp_rank + 1 != sp_world:
+        return x
+    # 只有最后一个 rank 需要截断
+    pad = sp_world - (unpad_dim_size % sp_world)
+    return x[..., :-pad]  # 简化表示
+```
+
+**适用场景**：当需要在 SP 分片状态下就移除 padding（而非先 gather 再 unpad）时使用 `remove_last_rank_padding`。
 
 ### 9.2 通信-计算重叠
 
@@ -1085,10 +1290,13 @@ print(prof.key_averages().table(sort_by="cuda_time_total"))
 
 ### 11.1 当前限制
 
-1. **Head 数量约束**：`num_heads` 必须能被 `ulysses_size` 整除
+1. **Head 数量约束**（`async_ulysses.py:79-86`）：
+   - `num_q_heads` 必须能被 `ulysses_size` 整除
+   - 如果 `ulysses_size > num_kv_heads`（GQA 场景），则 `ulysses_size` 必须是 `num_kv_heads` 的倍数
+   - 否则（`ulysses_size <= num_kv_heads`），`num_kv_heads` 自然需要能被 `ulysses_size` 整除
 2. **Context Parallel 未完全支持**：`cp_size` 参数存在，但功能未实现
 3. **解耦 SP 模式未实现**：`include_sp_in_fsdp` 必须为 `True`
-4. **NPU 异步模式限制**：Ascend NPU 暂不支持异步 Ulysses
+4. **NPU 异步模式**：源码中异步模式已支持 NPU 的 RMSNorm 前向/反向传播（通过 `torch_npu.npu_rms_norm` / `torch_npu.npu_rms_norm_backward`，见 `async_ulysses.py:158-160, 290-303`），但 LayerNorm 仅支持 CUDA（使用 `fused_layer_norm_cuda`）。测试中跳过 NPU（`test_async_ulysses.py:66`）是因为测试使用了 LayerNorm 而非 RMSNorm
 
 ### 11.2 不支持的场景
 
@@ -1134,8 +1342,9 @@ ulysses_size = min(
 # GPU: 优先使用异步模式
 sp_async = True  # 如果模型支持 QK normalization
 
-# NPU: 使用同步模式
-sp_async = False
+# NPU: 异步模式支持 RMSNorm，不支持 LayerNorm
+sp_async = True   # 使用 RMSNorm 时可用
+sp_async = False   # 使用 LayerNorm 时需要同步模式
 ```
 
 ### 12.3 调试技巧
@@ -1207,6 +1416,6 @@ logger.debug(f"Ulysses rank: {get_ulysses_sequence_parallel_rank()}")
 
 ---
 
-**文档版本**: 1.0
-**最后更新**: 2026-01-03
+**文档版本**: 1.1
+**最后更新**: 2026-02-09
 **作者**: VeOmni Team Analysis

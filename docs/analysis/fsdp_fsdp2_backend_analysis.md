@@ -2,8 +2,9 @@
 
 > **作者**: Claude Code (Anthropic)
 > **日期**: 2026-01-04
-> **版本**: v1.0
+> **版本**: v1.1
 > **代码库版本**: VeOmni v0.1.0
+> **最后更新**: 2026-02-10
 
 ---
 
@@ -49,18 +50,18 @@ VeOmni 框架实现了 FSDP1 和 FSDP2 两种 backend，具有以下特点：
 
 ```
 veomni/distributed/
-├── parallel_state.py (580行)        # 并行状态管理和 DeviceMesh 配置
-├── torch_parallelize.py (508行)     # FSDP1/FSDP2 入口函数
-├── parallel_plan.py (171行)         # Expert Parallelism 计划系统
+├── parallel_state.py (579行)        # 并行状态管理和 DeviceMesh 配置
+├── torch_parallelize.py (523行)     # FSDP1/FSDP2 入口函数
+├── parallel_plan.py (170行)         # Expert Parallelism 计划系统
 ├── fsdp/
-│   ├── initialize.py (350行)        # FSDP1 参数初始化和加载
-│   ├── extension.py (452行)         # FSDP1 DTensor 扩展和检查点钩子
-│   └── clip_grad_norm.py (138行)    # FSDP1 EP 感知梯度裁剪
+│   ├── initialize.py (349行)        # FSDP1 参数初始化和加载
+│   ├── extension.py (451行)         # FSDP1 DTensor 扩展和检查点钩子
+│   └── clip_grad_norm.py (137行)    # FSDP1 EP 感知梯度裁剪
 └── fsdp2/
-    └── clip_grad_norm.py (171行)    # FSDP2 EP 感知梯度裁剪
+    └── clip_grad_norm.py (170行)    # FSDP2 EP 感知梯度裁剪
 
 veomni/optim/
-└── optimizer.py (444行)             # MultiOptimizer (EP+FSDP2)
+└── optimizer.py (443行)             # MultiOptimizer (EP+FSDP2)
 
 veomni/models/transformers/
 └── qwen3_moe/parallel_plan.py       # Qwen3-MoE EP 计划示例
@@ -164,6 +165,9 @@ class ParallelState:
     # 设备网格
     device_mesh: Optional["DeviceMesh"] = None
     ep_fsdp_device_mesh: Optional["DeviceMesh"] = None
+
+    # 异步模式
+    async_enabled: Optional[bool] = False  # 是否启用异步序列并行
 ```
 
 **关键设计**:
@@ -342,6 +346,37 @@ if sp_mesh_dim_names != []:
 
 ### 3.4 关键属性和方法
 
+**FSDP 通信组** (`parallel_state.py:235-238`):
+
+```python
+@property
+def fsdp_group(self) -> Optional["ProcessGroup"]:
+    if self.device_mesh is not None:
+        return self.device_mesh.get_group("dp_sp")
+```
+
+> **重要**: `fsdp_group` 返回的是 `dp_sp` 组（包含 `dp_replicate + dp_shard + ulysses + cp`），而不是纯粹的 FSDP 分片组。这意味着 FSDP 的通信组包含了数据并行和序列并行的所有 rank。这一设计使得损失 all-reduce 和 FSDP 梯度同步使用相同的通信组，确保了梯度裁剪和损失缩放的一致性。
+
+**FSDP 大小** (`parallel_state.py:275-277`):
+
+```python
+@property
+def fsdp_size(self) -> int:
+    return self.world_size // (self.pp_size * self.tp_size)
+```
+
+**用途**: 在 `mean_global_loss()` 中用于补偿 FSDP 的梯度除法 (详见 [13.6](#136-损失缩放与-fsdp-梯度补偿))。
+
+**FSDP 启用状态** (`parallel_state.py:272-273`):
+
+```python
+@property
+def fsdp_enabled(self) -> bool:
+    return self.fsdp_size > 1
+```
+
+> **注意**: `fsdp_enabled` 依赖 `fsdp_size`，即 `world_size // (pp_size * tp_size) > 1`。这意味着只要有至少 2 个进程参与（且不是被 PP/TP 完全占用），FSDP 就被认为是"启用"的——即使 `dp_mode` 设置为 `"ddp"` 也是如此。`build_parallelize_model` 根据此属性决定是否调用 FSDP/DDP 包装。
+
 **FSDP 网格** (`parallel_state.py:252-269`):
 
 ```python
@@ -389,14 +424,16 @@ def ep_gradient_divide_factor(self) -> int:
 
 ### 4.1 入口函数
 
-**文件**: `veomni/distributed/torch_parallelize.py:79-225`
+**文件**: `veomni/distributed/torch_parallelize.py:84-234`
 
 ```python
 def parallelize_model_fsdp1(
     model: "nn.Module",
     weights_path: Optional[str] = None,
     enable_full_shard: bool = True,
+    enable_shard_grad_op: bool = False,
     enable_mixed_precision: bool = True,
+    use_orig_params: bool = True,
     basic_modules: Optional[List[str]] = None,
     fsdp_no_shard_states=None,
     fsdp_no_shard_states_fqn=None,
@@ -408,7 +445,7 @@ def parallelize_model_fsdp1(
 
 ### 4.2 流程详解
 
-**步骤 1: 应用 Expert Parallelism** (`torch_parallelize.py:96-107`)
+**步骤 1: 应用 Expert Parallelism** (`torch_parallelize.py:104-117`)
 
 ```python
 parallel_state = get_parallel_state()
@@ -428,7 +465,7 @@ else:
 
 **ParallelPlan.apply()** 详解见 [6.2 ParallelPlan 系统](#62-parallelplan-系统)
 
-**步骤 2: 配置 FSDP 包装策略** (`torch_parallelize.py:109-127`)
+**步骤 2: 配置 FSDP 包装策略** (`torch_parallelize.py:119-136`)
 
 ```python
 wrap_policy = partial(
@@ -438,27 +475,41 @@ wrap_policy = partial(
 
 # 确定分片策略
 if parallel_state.fsdp_mesh.ndim > 1 and parallel_state.fsdp_mesh.size() > 1:
-    strategy = ShardingStrategy.HYBRID_SHARD
+    strategy = ShardingStrategy.HYBRID_SHARD if enable_full_shard else ShardingStrategy._HYBRID_SHARD_ZERO2
 else:
-    strategy = ShardingStrategy.FULL_SHARD
+    strategy = ShardingStrategy.FULL_SHARD if enable_full_shard else ShardingStrategy.SHARD_GRAD_OP
 
 fsdp_kwargs = {
     "auto_wrap_policy": wrap_policy,
     "ignored_states": fsdp_no_shard_states,
     "device_id": get_device_id(),
-    "sharding_strategy": strategy if enable_full_shard else ShardingStrategy.NO_SHARD,
-    "use_orig_params": True,
+    "sharding_strategy": strategy if enable_full_shard or enable_shard_grad_op else ShardingStrategy.NO_SHARD,
+    "use_orig_params": use_orig_params,
 }
 
 fsdp_kwargs["device_mesh"] = parallel_state.fsdp_mesh
+
+# 支持外部传入额外的 FSDP 参数
+fsdp_kwargs.update(kwargs.pop("fsdp_kwargs", {}))
 ```
 
 **分片策略选择**:
-- **HYBRID_SHARD**: HSDP (2D mesh)，复制 + 分片
-- **FULL_SHARD**: 标准 FSDP (1D mesh)，全分片
+
+| 条件 | HSDP (2D mesh) | 非 HSDP (1D mesh) |
+|------|---------------|------------------|
+| `enable_full_shard=True` | `HYBRID_SHARD` | `FULL_SHARD` |
+| `enable_shard_grad_op=True` | `_HYBRID_SHARD_ZERO2` | `SHARD_GRAD_OP` |
+| 两者都为 False | `NO_SHARD` | `NO_SHARD` |
+
+- **HYBRID_SHARD**: HSDP (2D mesh)，复制 + 全分片 (ZeRO-3)
+- **_HYBRID_SHARD_ZERO2**: HSDP (2D mesh)，复制 + 梯度/优化器分片 (ZeRO-2)
+- **FULL_SHARD**: 标准 FSDP (1D mesh)，全分片 (ZeRO-3)
+- **SHARD_GRAD_OP**: 标准 FSDP (1D mesh)，梯度/优化器分片 (ZeRO-2)
 - **NO_SHARD**: DDP 模式，不分片 (用于调试)
 
-**步骤 3: 混合精度配置** (`torch_parallelize.py:129-139`)
+> **注意**: `enable_full_shard` 和 `enable_shard_grad_op` 不能同时为 True，在函数开头有断言检查。`fsdp_kwargs.update(kwargs.pop("fsdp_kwargs", {}))` 提供了一个扩展点，允许调用方传入额外的 FSDP 配置。
+
+**步骤 3: 混合精度配置** (`torch_parallelize.py:138-148`)
 
 ```python
 if enable_mixed_precision:
@@ -473,7 +524,7 @@ if enable_mixed_precision:
     fsdp_kwargs["mixed_precision"] = mixed_precision
 ```
 
-**步骤 4: 初始化模式** (`torch_parallelize.py:141-170`)
+**步骤 4: 初始化模式** (`torch_parallelize.py:150-169`)
 
 VeOmni 支持三种初始化模式：
 
@@ -484,7 +535,7 @@ VeOmni 支持三种初始化模式：
 # 每个 rank 独立初始化参数，然后 FSDP 自动分片
 ```
 
-**模式 B: CPU Rank0 初始化** (`torch_parallelize.py:141-145`)
+**模式 B: CPU Rank0 初始化** (`torch_parallelize.py:150-154`)
 
 ```python
 if kwargs.get("init_device") == "cpu":
@@ -497,7 +548,7 @@ if kwargs.get("init_device") == "cpu":
 - 其他 rank 使用 `init_fsdp_fn` 创建空 tensor
 - FSDP 自动同步参数 (`sync_module_states=True`)
 
-**模式 C: Meta 设备初始化** (`torch_parallelize.py:146-160`)
+**模式 C: Meta 设备初始化** (`torch_parallelize.py:155-169`)
 
 ```python
 elif kwargs.get("init_device") == "meta":
@@ -508,6 +559,9 @@ elif kwargs.get("init_device") == "meta":
     if not shard_states and weights_path:
         shard_states = parallel_load_safetensors(weights_path)
 
+    # 转换权重键名以匹配 HuggingFace 格式
+    shard_states = _convert_state_dict_keys(shard_states, model)
+
     fsdp_kwargs["param_init_fn"] = parallel_init_fsdp_fn(
         model,
         shard_states.copy(),
@@ -516,13 +570,15 @@ elif kwargs.get("init_device") == "meta":
     )
 ```
 
+> **注意**: `_convert_state_dict_keys` (`torch_parallelize.py:80-81`) 使用 `convert_weight_key()` 将权重键名转换为模型期望的格式，确保 HuggingFace 权重文件的键名与 VeOmni 模型兼容。
+
 - 模型在 meta 设备上创建 (无内存占用)
 - `parallel_load_safetensors` 并行加载权重文件
 - `parallel_init_fsdp_fn` 在初始化时加载和广播参数
 
 详见 [4.3 参数初始化](#43-参数初始化)
 
-**步骤 5: 应用 FSDP 包装** (`torch_parallelize.py:172-206`)
+**步骤 5: 应用 FSDP 包装** (`torch_parallelize.py:182-216`)
 
 ```python
 # 首先包装根模型
@@ -556,7 +612,15 @@ if fsdp_no_shard_states is not None:
 - 专家模块使用 `ep_fsdp` 网格 (不包含 EP 维度)
 - 梯度除因子乘以 `ep_size`，补偿 EP 维度的梯度分割
 
-**步骤 6: 注册检查点扩展** (`torch_parallelize.py:209-216`)
+**步骤 5.5: 延迟初始化** (`torch_parallelize.py:216`)
+
+```python
+_lazy_init(model, model)
+```
+
+> FSDP 包装完成后，调用 `_lazy_init` 完成内部状态的初始化。这是 PyTorch FSDP1 的标准步骤，确保所有 FSDP 相关的内部数据结构被正确设置。
+
+**步骤 6: 注册检查点扩展** (`torch_parallelize.py:218-225`)
 
 ```python
 save_hook_mesh = parallel_state.ep_fsdp_device_mesh if parallel_state.ep_enabled else None
@@ -569,7 +633,7 @@ register_checkpoint_extension(
 
 详见 [4.4 检查点扩展](#44-检查点扩展-fsdpextensions)
 
-**步骤 7: 绑定 EP 感知梯度裁剪** (`torch_parallelize.py:218-219`)
+**步骤 7: 绑定 EP 感知梯度裁剪** (`torch_parallelize.py:227-228`)
 
 ```python
 if parallel_state.ep_enabled:
@@ -1178,12 +1242,13 @@ def register_checkpoint_extension(
 
 ### 5.1 入口函数
 
-**文件**: `veomni/distributed/torch_parallelize.py:228-425`
+**文件**: `veomni/distributed/torch_parallelize.py:237-435`
 
 ```python
 def parallelize_model_fsdp2(
     model: "nn.Module",
     weights_path: Optional[str] = None,
+    enable_reshard_after_forward: bool = True,
     enable_mixed_precision: bool = True,
     basic_modules: Optional[List[str]] = None,
     **kwargs,
@@ -1199,9 +1264,11 @@ def parallelize_model_fsdp2(
     """
 ```
 
+> **注意**: `enable_reshard_after_forward` 参数控制前向传播后是否释放完整参数，重新分片以节省显存。此参数被直接包含在 `fsdp_kwargs` 中。另外，`build_parallelize_model` 还传入了 `enable_full_shard` 参数，但它通过 `**kwargs` 进入后并未被 `parallelize_model_fsdp2` 使用——这是一个仅对 FSDP1 有效的参数。
+
 ### 5.2 流程详解
 
-**步骤 1: 获取目标类并构建层对** (`torch_parallelize.py:246-292`)
+**步骤 1: 获取目标类并构建层对** (`torch_parallelize.py:254-302`)
 
 ```python
 parallel_state = get_parallel_state()
@@ -1237,10 +1304,10 @@ for layer_fqn, layer_mod in decoder_blocks:
         layer_pairs.append((layer_fqn, layer_mod, None))
 ```
 
-**步骤 2: 配置 FSDP2 参数** (`torch_parallelize.py:294-334`)
+**步骤 2: 配置 FSDP2 参数** (`torch_parallelize.py:304-344`)
 
 ```python
-fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh}
+fsdp_kwargs = {"mesh": parallel_state.fsdp_mesh, "reshard_after_forward": enable_reshard_after_forward}
 
 # 混合精度策略
 if enable_mixed_precision:
@@ -1287,7 +1354,7 @@ if parallel_state.ep_enabled:
 - **维度 1**: 隐藏维度，可以安全分片
 - **维度 2**: 输入维度，也可以分片但通常选择隐藏维度
 
-**步骤 3: 自底向上应用 fully_shard** (`torch_parallelize.py:342-381`)
+**步骤 3: 自底向上应用 fully_shard** (`torch_parallelize.py:355-391`)
 
 ```python
 # NPU PreSumMul 补丁 (仅 NPU + EP)
@@ -1329,7 +1396,7 @@ fully_shard(model, **fsdp_kwargs)
 - 专家模块可以使用不同的分片策略
 - 高精度模块可以保持在 GPU 上 (`reshard_after_forward=False`)
 
-**步骤 4: 配置手动预取** (`torch_parallelize.py:383-400`)
+**步骤 4: 配置手动预取** (`torch_parallelize.py:393-410`)
 
 ```python
 need_manual_prefetch = parallel_state.ep_enabled or mp_ignored_classes is not None
@@ -1359,7 +1426,7 @@ if need_manual_prefetch:
 - 专家模块和注意力模块需要协调预取
 - 手动预取可以优化通信和计算重叠
 
-**步骤 5: 加载权重** (`torch_parallelize.py:402-418`)
+**步骤 5: 加载权重** (`torch_parallelize.py:412-428`)
 
 ```python
 assert kwargs.get("init_device") == "meta", "Please use init_device: meta for FSDP2"
@@ -1377,7 +1444,7 @@ else:
         load_model_weights(model, weights_path, get_device_type(), dtensor_factory=distribute_tensor)
 ```
 
-**步骤 6: 注册梯度裁剪** (`torch_parallelize.py:420-423`)
+**步骤 6: 注册梯度裁剪** (`torch_parallelize.py:430-433`)
 
 ```python
 from .fsdp2 import clip_grad_norm as clip_grad_norm_fn
@@ -1664,11 +1731,11 @@ ShardingStrategy.HYBRID_SHARD        # 混合分片 (HSDP)
 
 **配置**:
 ```python
-# torch_parallelize.py:112-115
+# torch_parallelize.py:122-125
 if parallel_state.fsdp_mesh.ndim > 1 and parallel_state.fsdp_mesh.size() > 1:
-    strategy = ShardingStrategy.HYBRID_SHARD
+    strategy = ShardingStrategy.HYBRID_SHARD if enable_full_shard else ShardingStrategy._HYBRID_SHARD_ZERO2
 else:
-    strategy = ShardingStrategy.FULL_SHARD
+    strategy = ShardingStrategy.FULL_SHARD if enable_full_shard else ShardingStrategy.SHARD_GRAD_OP
 ```
 
 **DeviceMesh 示例**:
@@ -1708,7 +1775,7 @@ def default_shard_placement_fn(param: torch.nn.Parameter) -> Shard:
 #### 7.2.2 专家参数分片
 
 ```python
-# torch_parallelize.py:331-333
+# torch_parallelize.py:341-342
 def _experts_shard_placement_fn(param):
     return Shard(1)  # 强制沿维度 1 分片
 ```
@@ -1922,7 +1989,7 @@ non_ep_params: List[torch.nn.Parameter] = [
 ]
 ```
 
-**_ep_param_groups 来源**: 由 `build_ep_fsdp2_optimizer` 设置 (见 [10.2](#102-multioptimizer))
+**_ep_param_groups 来源**: 由 `build_ep_fsdp2_optimizer` 设置 (见 [10.3](#103-构建-ep-fsdp2-优化器))
 
 #### 8.2.2 分组 reduction
 
@@ -1944,7 +2011,13 @@ if math.isinf(norm_type):
     total_norm = torch.maximum(non_ep_total, ep_total)
 else:
     total_norm = (non_ep_total + ep_total) ** (1.0 / float(norm_type))
+
+# 统一裁剪系数应用于两组参数
+torch.nn.utils.clip_grads_with_norm_(ep_params, max_norm, total_norm, foreach=foreach)
+torch.nn.utils.clip_grads_with_norm_(non_ep_params, max_norm, total_norm, foreach=foreach)
 ```
+
+> **FSDP1 vs FSDP2 裁剪方式差异**: FSDP1 手动计算裁剪系数并逐个乘以梯度 (`clip_coef = max_norm / (total_norm + 1e-6); grad.mul_(clip_coef_clamped)`)，而 FSDP2 使用 PyTorch 2.x 原生的 `torch.nn.utils.clip_grads_with_norm_()` 函数，代码更简洁且与 PyTorch 生态更一致。
 
 #### 8.2.3 辅助函数
 
@@ -2076,7 +2149,7 @@ def _post_backward_hook(grad_output):
 
 ### 9.1 FSDP1 混合精度
 
-**配置**: `torch_parallelize.py:129-139`
+**配置**: `torch_parallelize.py:138-148`
 
 ```python
 mixed_precision = MixedPrecision(
@@ -2119,7 +2192,7 @@ param_bf16 = param.to(torch.bfloat16)
 **忽略混合精度的模块**:
 
 ```python
-# torch_parallelize.py:136-137
+# torch_parallelize.py:145-146
 if hasattr(model, "get_ignore_modules_in_mixed_precision"):
     mixed_precision._module_classes_to_ignore += model.get_ignore_modules_in_mixed_precision()
 ```
@@ -2134,7 +2207,7 @@ def get_ignore_modules_in_mixed_precision(self):
 
 ### 9.2 FSDP2 混合精度
 
-**配置**: `torch_parallelize.py:297-302`
+**配置**: `torch_parallelize.py:307-312`
 
 ```python
 mp_policy = MixedPrecisionPolicy(
@@ -2152,7 +2225,9 @@ mp_policy = MixedPrecisionPolicy(
 | **模块级控制** | `_module_classes_to_ignore` | 不同 `fully_shard` 调用 |
 | **灵活性** | 全局设置 | 模块级设置 |
 
-**忽略混合精度的模块** (`torch_parallelize.py:309-318`):
+> **注意**: DDP 路径 (`dp_mode="ddp"`) 也支持混合精度 (`torch_parallelize.py:511-521`)。DDP 使用相同的 `MixedPrecision` 配置，但 `buffer_dtype=torch.bfloat16`，与 FSDP1 的 `buffer_dtype=torch.float32` 不同。
+
+**忽略混合精度的模块** (`torch_parallelize.py:319-328`):
 
 ```python
 if modules_to_ignore_in_mixed_precision:
@@ -2164,7 +2239,7 @@ if modules_to_ignore_in_mixed_precision:
 
 **应用**:
 ```python
-# torch_parallelize.py:370-374
+# torch_parallelize.py:380-384
 if mp_ignored_classes:
     for sub_mod in layer_mod.modules():
         if isinstance(sub_mod, mp_ignored_classes) and sub_mod is not layer_mod:
@@ -2194,6 +2269,44 @@ if mp_ignored_classes:
 
 # 结论: FP32 all-reduce 保证梯度精度
 ```
+
+### 9.4 FSDP2 Reshard 控制
+
+FSDP2 提供两个重要的 reshard 控制参数:
+
+**`enable_reshard_after_forward`** (`TrainingArguments:423-425`):
+- 控制前向传播后是否释放 all-gather 的完整参数
+- 设为 `True` (默认) 节省显存，但反向传播时需要重新 all-gather
+- 设为 `False` 保留参数在 GPU 上，减少通信但增加显存占用
+
+**`enable_reshard_after_backward`** (`TrainingArguments:427-429`):
+- 控制反向传播后是否释放参数
+- 在梯度累积场景中尤为重要
+
+**梯度累积动态 Reshard 优化** (`train_torch.py:286-294`):
+
+```python
+if (
+    args.train.data_parallel_mode == "fsdp2"
+    and not args.train.enable_reshard_after_backward
+    and num_micro_steps > 1
+):
+    if micro_step == 0:
+        model.set_reshard_after_backward(False)
+    elif micro_step == num_micro_steps - 1:
+        model.set_reshard_after_backward(True)
+```
+
+**设计意图**:
+- 在梯度累积的中间微步 (`micro_step = 0` 到 `num_micro_steps - 2`)，设置 `reshard_after_backward=False`
+- 参数在反向传播后保持 all-gather 状态，避免下一个微步的重复 all-gather
+- 在最后一个微步 (`micro_step == num_micro_steps - 1`)，恢复 `reshard_after_backward=True`
+- 这样最后一步完成后参数被释放，为优化器更新腾出显存
+
+**性能影响**:
+- 减少了 `(num_micro_steps - 1)` 次反向 all-gather 通信
+- 代价是中间微步期间占用更多显存 (持有完整参数)
+- 适用于显存充裕但通信是瓶颈的场景
 
 ---
 
@@ -2621,54 +2734,126 @@ def get_state_dict_with_ep_dim_preprocess(self, state_dict, action):
     return state_dict
 ```
 
-**restore_ep_dim** (未在摘要中显示，推断实现):
+**restore_ep_dim** (`dcp_checkpointer.py:225-249`):
 
 ```python
-def restore_ep_dim(tensor: DTensor, ep_fsdp_mesh: DeviceMesh) -> DTensor:
+def restore_ep_dim(orgin_tensor: torch.Tensor, device_mesh: DeviceMesh):
     """
-    从 DTensor[ep_fsdp] 恢复为 DTensor[ep, ep_fsdp]
+    Restore EP dim so that DCP can be aware about EP ranks
 
+    从 DTensor[ep_fsdp] 恢复为 DTensor[ep, ep_fsdp]
     例如: [16, 384, 768] (本地) -> DTensor[ep, ep_fsdp] 表示 [128, 768, 768] (全局)
     """
-    ep_mesh = ep_fsdp_mesh["ep"]
-    spec_info = getattr(tensor, "_spec_info", None)
+    assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
+    ep_mesh = device_mesh["ep"]
 
-    if spec_info is None:
-        return tensor
+    if isinstance(orgin_tensor, DTensor):
+        # EP+FSDP2: 原始张量已经是 DTensor (由 FSDP2 分片)
+        # 使用 _local_tensor 获取底层本地数据，创建包含 EP 和 FSDP 两个维度的 DTensor
+        dtensor = DTensor.from_local(
+            orgin_tensor._local_tensor, device_mesh=device_mesh, placements=[Shard(0), Shard(1)]
+        )
+    elif torch.is_tensor(orgin_tensor):
+        # 仅 EP，无 FSDP: 普通 Tensor 创建仅含 EP 维度的 DTensor
+        dtensor = DTensor.from_local(orgin_tensor, device_mesh=ep_mesh, placements=[Shard(0)])
+    else:
+        raise RuntimeError(f"origin_tensor - {orgin_tensor} is not a tensor!")
 
-    # 创建 EP 维度的 Shard placement
-    ep_placement = [Shard(0)] + tensor.placements
-    # 从 ep_fsdp DTensor 创建 ep_fsdp_mesh DTensor
-    restored = DTensor.from_local(
-        tensor.to_local(),
-        device_mesh=ep_fsdp_mesh,
-        placements=ep_placement,
-    )
-    return restored
+    return dtensor
 ```
 
-**drop_ep_dim**:
+**drop_ep_dim** (`dcp_checkpointer.py:204-222`):
 
 ```python
-def drop_ep_dim(tensor: DTensor, ep_fsdp_mesh: DeviceMesh) -> DTensor:
+def drop_ep_dim(loaded_tensor: torch.Tensor, device_mesh: DeviceMesh):
     """
-    从 DTensor[ep, ep_fsdp] 转换为 DTensor[ep_fsdp]
+    Drop EP dims after loading from DCP so that EP-FSDP would not be confused
 
-    例如: DTensor[ep, ep_fsdp] 表示 [128, 768, 768] (全局) -> [16, 384, 768] (本地)
+    从 DTensor[ep, ep_fsdp] 转换为 DTensor[ep_fsdp] 或普通 Tensor
     """
-    # 简单地移除第一个 placement
-    new_placements = tensor.placements[1:]
-    ep_fsdp_only_mesh = ep_fsdp_mesh["ep_fsdp"]
+    assert device_mesh.ndim == 2, f"global_mesh.ndim must be 2, got {device_mesh.ndim}"
+    ep_fsdp_mesh = device_mesh["ep_fsdp"]
 
-    dropped = DTensor.from_local(
-        tensor.to_local(),
-        device_mesh=ep_fsdp_only_mesh,
-        placements=new_placements,
-    )
-    return dropped
+    if len(loaded_tensor.placements) == 2:
+        # EP+FSDP2: 从 DTensor[ep, ep_fsdp] 转为 DTensor[ep_fsdp]
+        # 取底层本地数据，在 ep_fsdp 子网格上重建 DTensor
+        tensor_to_put = DTensor.from_local(
+            loaded_tensor._local_tensor, device_mesh=ep_fsdp_mesh, placements=[Shard(1)]
+        )
+    elif len(loaded_tensor.placements) == 1:
+        # 仅 EP: 直接取本地数据
+        tensor_to_put = loaded_tensor.to_local()
+    else:
+        raise RuntimeError(
+            f"Expect EP paramters from checkpoints to be DTensor with 1-dim (no FSDP) or 2-dim (EP+FSDP), got {loaded_tensor}"
+        )
+
+    return tensor_to_put
 ```
 
-### 11.3 检查点保存流程
+**实现要点**:
+- `restore_ep_dim`: 使用 `_local_tensor` (而非 `to_local()`) 获取底层数据，因为 DTensor 参数的本地数据已经被 FSDP2 分片，需要保持分片状态
+- `restore_ep_dim`: EP+FSDP2 情况下使用 `[Shard(0), Shard(1)]` 放置策略——EP 沿维度 0，FSDP 沿维度 1
+- `drop_ep_dim`: 根据 placements 数量区分处理——2 维表示 EP+FSDP，1 维表示仅 EP
+- `drop_ep_dim`: 对 EP+FSDP2 使用 `[Shard(1)]` 放置，保留 FSDP 的维度 1 分片信息
+
+### 11.3 OptimizerState 包装器
+
+**类**: `OptimizerState` (`dcp_checkpointer.py:105-201`)
+
+与 `ModelState` 类似，`OptimizerState` 也实现了 EP-FSDP2 感知的状态字典处理。核心区别在于优化器状态字典的键名不直接匹配 `ep_fqn2spec_info`，需要通过子串匹配来找到对应的 EP 参数。
+
+```python
+class OptimizerState(Stateful):
+    def __init__(self, model, optimizer):
+        self.model = model
+        self.optimizer = optimizer
+        self.parallel_state = get_parallel_state()
+        self.ep_fqn2spec_info = getattr(self.model, "_fqn2spec_info", None)
+        self.should_ep_aware = self.ep_fqn2spec_info is not None and self.parallel_state.dp_mode == "fsdp2"
+```
+
+**关键处理逻辑**:
+- **保存时**: 通过 `MultiOptimizer.state_dict()` 获取合并的优化器状态，然后使用 `restore_ep_dim` 恢复 EP 维度
+- **加载时**: 使用 `drop_ep_dim` 移除 EP 维度，然后通过 `MultiOptimizer.load_state_dict()` 分发到子优化器
+- **键名匹配**: 使用子串匹配找到 EP 参数对应的优化器状态 (例如 `state.model.layers.0.mlp.experts.gate_proj.step` 匹配 `model.layers.0.mlp.experts.gate_proj`)
+- **标量处理**: 0 维张量和非张量值 (如超参数) 不进行分片处理
+
+### 11.4 异步检查点保存
+
+**类方法**: `DistributedCheckpointer.execute_save` (`dcp_checkpointer.py:350-383`)
+
+```python
+@classmethod
+def execute_save(cls, save_state, storage_writer, save_async):
+    if save_async:
+        # 懒创建专用 Gloo 进程组
+        if cls._async_process_group is None:
+            cls._async_process_group = dist.new_group(backend="gloo")
+
+        # 等待前一次异步保存完成
+        if cls.dcp_save_future is not None:
+            cls.dcp_save_future.result()
+            cls.dcp_save_future = None
+            dist.barrier()
+
+        # 启动新的异步保存
+        cls.dcp_save_future = dcp.async_save(
+            state_dict=save_state,
+            storage_writer=storage_writer,
+            process_group=cls._async_process_group,
+        )
+    else:
+        dcp.save(state_dict=save_state, storage_writer=storage_writer)
+        dist.barrier()
+```
+
+**设计要点**:
+- **专用 Gloo 进程组** (`_async_process_group`): 异步保存使用独立的 Gloo 通信后端，避免与训练的 NCCL 通信干扰
+- **Future 跟踪** (`dcp_save_future`): 通过 `dcp.async_save` 返回的 future 跟踪异步保存进度
+- **串行化**: 如果前一次异步保存未完成，会先等待其完成再启动新的保存
+
+### 11.5 检查点保存流程
 
 **伪代码**:
 
@@ -2703,7 +2888,7 @@ def save_fsdp2_checkpoint(model, optimizer, path):
     )
 ```
 
-### 11.4 检查点加载流程
+### 11.6 检查点加载流程
 
 ```python
 # FSDP1 路径
@@ -2734,7 +2919,7 @@ def load_fsdp2_checkpoint(model, optimizer, path):
     optimizer.load_state_dict(state_dict["optimizer"])
 ```
 
-### 11.5 HuggingFace 格式导出
+### 11.7 HuggingFace 格式导出
 
 **TrainerCheckpointer.export_huggingface_checkpoint()**:
 
@@ -2796,19 +2981,19 @@ mesh_dim_names: ("ep", "ep_fsdp")
 
 Rank 布局:
        ep_fsdp=0  1   2   3   4   5   6   7
-ep=0     0      8  16  24   1   9  17  25
-ep=1     2     10  18  26   3  11  19  27
-ep=2     4     12  20  28   5  13  21  29
-ep=3     6     14  22  30   7  15  23  31
+ep=0     0      4   8  12  16  20  24  28
+ep=1     1      5   9  13  17  21  25  29
+ep=2     2      6  10  14  18  22  26  30
+ep=3     3      7  11  15  19  23  27  31
 
 解释:
-- EP 组 0: {0, 8, 16, 24, 1, 9, 17, 25}
-- EP 组 1: {2, 10, 18, 26, 3, 11, 19, 27}
-- EP 组 2: {4, 12, 20, 28, 5, 13, 21, 29}
-- EP 组 3: {6, 14, 22, 30, 7, 15, 23, 31}
+- EP 组 0: {0, 4, 8, 12, 16, 20, 24, 28}
+- EP 组 1: {1, 5, 9, 13, 17, 21, 25, 29}
+- EP 组 2: {2, 6, 10, 14, 18, 22, 26, 30}
+- EP 组 3: {3, 7, 11, 15, 19, 23, 27, 31}
 
-EP-FSDP 组 0: {0, 2, 4, 6}
-EP-FSDP 组 1: {8, 10, 12, 14}
+EP-FSDP 组 0: {0, 1, 2, 3}
+EP-FSDP 组 1: {4, 5, 6, 7}
 ...
 ```
 
@@ -2822,7 +3007,7 @@ EP-FSDP 组 1: {8, 10, 12, 14}
 
 **EP All-Gather** (EP 参数):
 ```
-组: {0, 8, 16, 24, 1, 9, 17, 25} (同一 EP 组)
+组: {0, 4, 8, 12, 16, 20, 24, 28} (同一 EP 组)
 通信量: (专家参数大小 / 8) * 7
 ```
 
@@ -2836,7 +3021,7 @@ EP-FSDP 组 1: {8, 10, 12, 14}
 
 ### 13.1 预取 (Prefetching)
 
-**FSDP1 自动预取** (`torch_parallelize.py:166-170`):
+**FSDP1 自动预取** (`torch_parallelize.py:175-179`):
 
 ```python
 if kwargs.pop("enable_forward_prefetch", False):
@@ -2846,7 +3031,7 @@ else:
     fsdp_kwargs["backward_prefetch"] = None
 ```
 
-**FSDP2 手动预取** (`torch_parallelize.py:383-400`):
+**FSDP2 手动预取** (`torch_parallelize.py:393-410`):
 
 ```python
 need_manual_prefetch = parallel_state.ep_enabled or mp_ignored_classes is not None
@@ -2882,7 +3067,7 @@ prefetch = [experts, gate, layer]  # 逆序
 **FSDP1 支持**:
 
 ```python
-# torch_parallelize.py:162-164
+# torch_parallelize.py:171-173
 if kwargs.pop("enable_fsdp_offload", False):
     fsdp_kwargs["cpu_offload"] = CPUOffload(offload_params=True)
 ```
@@ -2926,7 +3111,7 @@ optimizer.step()
 **启用**:
 
 ```python
-# torch_parallelize.py:453-464
+# torch_parallelize.py:466-477
 if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enable"):
     use_reentrant = kwargs.pop("enable_reentrant", False)
     model.gradient_checkpointing_enable(
@@ -2940,6 +3125,34 @@ if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enab
 **FSDP 兼容性**:
 - 推荐 `use_reentrant=False` (PyTorch 2.0+)
 - FSDP 会自动处理检查点与参数分片的交互
+
+### 13.6 损失缩放与 FSDP 梯度补偿
+
+**文件**: `veomni/utils/loss_utils.py:30-56`
+
+VeOmni 使用 `mean_global_loss()` 函数计算全局平均损失，而非简单的 `loss / dp_size`。核心公式:
+
+```python
+cur_loss = cur_loss * cur_token_len / all_reduced_len * get_parallel_state().fsdp_size
+```
+
+**为什么需要乘以 `fsdp_size`？**
+
+FSDP 在 reduce-scatter 时默认将梯度除以 FSDP 进程组大小。但 VeOmni 采用 token-weighted 损失缩放——每个 rank 的损失按其实际 token 数占全局 token 数的比例缩放，而不是简单的等分。因此需要乘以 `fsdp_size` 来抵消 FSDP 的默认除法，让最终梯度反映 token-weighted 的缩放。
+
+**计算流程**:
+
+1. 每个 rank 计算本地 token 数 `cur_token_len`
+2. 如果启用了序列并行，在 SP 组上 all-reduce token 数
+3. 全局 all-reduce 得到所有微批次的总 token 数 `all_reduced_len`
+4. 损失 = `cur_loss * (cur_token_len / all_reduced_len) * fsdp_size`
+
+**直观理解**: 假设 4 个 rank，rank 0 有 100 个 token，总共 400 个 token。
+- VeOmni 希望 rank 0 的梯度权重为 `100/400 = 0.25`
+- 但 FSDP 会在 reduce-scatter 时除以 4
+- 所以预先乘以 4: `loss * (100/400) * 4 = loss`
+- 经过 FSDP 除以 4 后: `loss / 4 = loss * 0.25`
+- 结果正好是期望的 token-weighted 梯度
 
 ---
 
@@ -3031,14 +3244,14 @@ if enable_gradient_checkpointing and hasattr(model, "gradient_checkpointing_enab
 
 **核心文件** (按重要性排序):
 
-1. `veomni/distributed/parallel_state.py` (580 行) - 并行状态管理
-2. `veomni/distributed/torch_parallelize.py` (508 行) - FSDP1/FSDP2 入口
-3. `veomni/distributed/parallel_plan.py` (171 行) - EP 计划系统
-4. `veomni/distributed/fsdp/initialize.py` (350 行) - FSDP1 参数初始化
-5. `veomni/distributed/fsdp/extension.py` (452 行) - FSDP1 检查点扩展
-6. `veomni/distributed/fsdp/clip_grad_norm.py` (138 行) - FSDP1 梯度裁剪
-7. `veomni/distributed/fsdp2/clip_grad_norm.py` (171 行) - FSDP2 梯度裁剪
-8. `veomni/optim/optimizer.py` (444 行) - 优化器和 MultiOptimizer
+1. `veomni/distributed/parallel_state.py` (579 行) - 并行状态管理
+2. `veomni/distributed/torch_parallelize.py` (523 行) - FSDP1/FSDP2 入口
+3. `veomni/distributed/parallel_plan.py` (170 行) - EP 计划系统
+4. `veomni/distributed/fsdp/initialize.py` (349 行) - FSDP1 参数初始化
+5. `veomni/distributed/fsdp/extension.py` (451 行) - FSDP1 检查点扩展
+6. `veomni/distributed/fsdp/clip_grad_norm.py` (137 行) - FSDP1 梯度裁剪
+7. `veomni/distributed/fsdp2/clip_grad_norm.py` (170 行) - FSDP2 梯度裁剪
+8. `veomni/optim/optimizer.py` (443 行) - 优化器和 MultiOptimizer
 9. `veomni/checkpoint/dcp_checkpointer.py` - DCP 检查点管理
 
 **辅助文件**:
@@ -3135,7 +3348,30 @@ if ps.global_rank == 0:
     print(f"FSDP Mesh: {ps.fsdp_mesh}")
 ```
 
-### B.2 检查 EP 参数分片
+### B.2 FSDP1 分组结构调试
+
+**函数**: `verbose_fsdp_grouping` (`torch_parallelize.py:62-77`)
+
+FSDP1 包装完成后 (第 230 行)，会自动调用此函数打印 FSDP 分组结构:
+
+```python
+def verbose_fsdp_grouping(model, prefix="", depth=0):
+    indent = "    " * depth
+    for name, child in model.named_children():
+        if isinstance(child, FullyShardedDataParallel):
+            module_names = [m_name for m_name, _ in child.named_modules()][1:]
+            strategy = child.sharding_strategy
+            logger.debug_rank0(f"{indent}├── [FSDP Group] {prefix}{name}")
+            logger.debug_rank0(f"{indent}│   ├── Sharding Strategy: {strategy}, Mixed Precision: {child.mixed_precision}")
+            logger.debug_rank0(f"{indent}│   └── Contains Modules: {module_names}")
+            verbose_fsdp_grouping(child, prefix=f"{prefix}{name}.", depth=depth + 1)
+        else:
+            verbose_fsdp_grouping(child, prefix=f"{prefix}{name}.", depth=depth)
+```
+
+**用法**: 设置日志级别为 DEBUG 即可在训练启动时看到 FSDP 的完整分组结构，便于验证 `auto_wrap_policy` 是否正确分组。
+
+### B.3 检查 EP 参数分片
 
 ```python
 for name, param in model.named_parameters():
@@ -3144,7 +3380,7 @@ for name, param in model.named_parameters():
         print(f"{name}: placement={spec_info.placement}, shape={param.shape}")
 ```
 
-### B.3 验证梯度范数
+### B.4 验证梯度范数
 
 ```python
 import torch.distributed as dist
@@ -3164,7 +3400,7 @@ if hasattr(model, "_ep_param_groups"):
     print(f"EP grad norm: {ep_norm}, Non-EP grad norm: {non_ep_norm}")
 ```
 
-### B.4 监控内存使用
+### B.5 监控内存使用
 
 ```python
 import torch
